@@ -6,6 +6,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
 from typing import List, Dict, Any, Optional
 from fastapi_mail import ConnectionConfig, FastMail, MessageSchema
+from dotenv import load_dotenv
+
+load_dotenv()
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
 # --- Local Imports ---
 from .tasks import run_full_analysis_pipeline, generate_chat_response, generate_reasoning_report
@@ -158,7 +162,7 @@ async def register(user: UserCreate, background_tasks: BackgroundTasks):
     await users_collection.insert_one(user_data)
     
     token = create_special_token(user.username, "email_verification", EMAIL_VERIFICATION_TOKEN_EXPIRE_MINUTES)
-    verification_link = f"http://localhost:5173/verify-email?token={token}"
+    verification_link = f"{FRONTEND_URL}/verify-email?token={token}"
     message = MessageSchema(
         subject="Verify Your Account",
         recipients=[user.email],
@@ -193,7 +197,7 @@ async def forgot_password(request: ForgotPasswordRequest, background_tasks: Back
     user = await users_collection.find_one({"email": request.email})
     if user:
         token = create_special_token(user["username"], "password_reset", PASSWORD_RESET_TOKEN_EXPIRE_MINUTES)
-        reset_link = f"http://localhost:5173/reset-password?token={token}"
+        reset_link = f"{FRONTEND_URL}/reset-password?token={token}"
         message = MessageSchema(
             subject="Password Reset Request", recipients=[request.email],
             body=f"Click the link to reset your password: {reset_link}", subtype="html"
