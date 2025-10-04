@@ -36,7 +36,7 @@ except Exception:
     faiss = None
 
 import wikipediaapi
-import nest_asyncio
+
 
 # Wordcloud + NLTK
 from wordcloud import WordCloud
@@ -51,8 +51,6 @@ stop_words = set(stopwords.words('english'))
 # Local dependencies (clients + API keys) — keep same names as dependencies.py
 from .dependencies import youtube_client, reddit_client, hf_client, HUGGINGFACE_API_KEY
 
-# Apply nest_asyncio for environments that may already have an event loop (jupyter/others)
-nest_asyncio.apply()
 
 # -----------------------------------------------------------------------------
 # Utilities

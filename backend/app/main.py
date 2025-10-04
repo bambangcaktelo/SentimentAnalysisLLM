@@ -301,3 +301,8 @@ async def handle_chat(job_id: str, chat_request: ChatRequest, current_user: dict
     new_chat_history = chat_history_for_llm + [{"role": "assistant", "content": ai_response}]
     await results_store_collection.update_one({"job_id": job_id}, {"$set": {"result.chat_history": new_chat_history}})
     return ChatResponse(response=ai_response, questions_remaining=questions_remaining)
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))  # Render assigns PORT env var
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
