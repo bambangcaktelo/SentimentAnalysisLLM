@@ -9,7 +9,7 @@ fastapi-mail==1.4.1
 requests==2.32.3
 aiohttp==3.9.5
 google-api-python-client==2.134.0
-praw==7.7.1
+praw==7.8.1
 beautifulsoup4==4.12.3
 httpx==0.27.0
 openai==1.35.3 

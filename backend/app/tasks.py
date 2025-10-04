@@ -19,22 +19,6 @@ import requests
 import aiohttp
 import feedparser
 
-# --- MEMORY OPTIMIZATION ---
-# The following libraries are removed to reduce memory consumption on free hosting tiers.
-# The RAG pipeline will use a lightweight fallback instead of local ML models.
-#
-# try:
-#     from sentence_transformers import SentenceTransformer
-# except Exception:
-#     SentenceTransformer = None
-#
-# try:
-#     import faiss
-# except Exception:
-#     faiss = None
-# ---------------------------
-
-import nest_asyncio
 
 # Wordcloud + NLTK
 from wordcloud import WordCloud
@@ -49,8 +33,7 @@ stop_words = set(stopwords.words('english'))
 # Local dependencies (clients + API keys) — keep same names as dependencies.py
 from .dependencies import youtube_client, reddit_client, hf_client, HUGGINGFACE_API_KEY
 
-# Apply nest_asyncio for environments that may already have an event loop (jupyter/others)
-nest_asyncio.apply()
+
 
 # -----------------------------------------------------------------------------
 # Utilities
