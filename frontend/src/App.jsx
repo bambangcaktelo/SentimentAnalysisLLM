@@ -656,7 +656,7 @@ const AuthModal = ({ onLoginSuccess, onClose }) => {
     const [isLoginView, setIsLoginView] = useState(true);
     const [error, setError] = useState('');
     const [message, setMessage] = useState('');
-    const [username, setUsername] = useState('');
+    const [username, setUsername] = useState(''); // This will hold the email or username
     const [email, setEmail] = useState('');
     const [password, setPassword] = useState('');
 
@@ -665,7 +665,9 @@ const AuthModal = ({ onLoginSuccess, onClose }) => {
         setError('');
         setMessage('');
         const endpoint = isLoginView ? '/token' : '/register';
-        const payload = isLoginView ? { username, password } : { username, email, password };
+        const payload = isLoginView 
+            ? { login_identifier: username, password } 
+            : { username, email, password };
 
         try {
             const response = await api.post(endpoint, payload);
@@ -680,7 +682,7 @@ const AuthModal = ({ onLoginSuccess, onClose }) => {
     };
 
     return (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-fadeIn">
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-fadeIn" onClick={onClose}>
             <div className="bg-gradient-to-br from-gray-800 to-gray-850 p-8 rounded-2xl shadow-2xl max-w-md w-full border border-gray-700 animate-scaleIn" onClick={(e) => e.stopPropagation()}>
                 <div className="flex justify-between items-center mb-6">
                     <h2 className="text-3xl font-bold text-white">{isLoginView ? 'Welcome Back' : 'Join Us'}</h2>
@@ -706,9 +708,9 @@ const AuthModal = ({ onLoginSuccess, onClose }) => {
                     
                     <div className="space-y-4">
                         <div>
-                            <label className="block text-gray-400 mb-2 font-semibold" htmlFor="username">Username</label>
+                            <label className="block text-gray-400 mb-2 font-semibold" htmlFor="login_identifier">{isLoginView ? 'Username or Email' : 'Username'}</label>
                             <input 
-                                id="username" 
+                                id="login_identifier" 
                                 type="text" 
                                 value={username} 
                                 onChange={(e) => setUsername(e.target.value)} 
@@ -755,7 +757,7 @@ const AuthModal = ({ onLoginSuccess, onClose }) => {
                         {isLoginView ? "Don't have an account? " : "Already have an account? "}
                         <button 
                             type="button" 
-                            onClick={() => setIsLoginView(!isLoginView)} 
+                            onClick={() => { setIsLoginView(!isLoginView); setError(''); setMessage(''); }} 
                             className="text-blue-400 hover:text-blue-300 font-semibold hover:underline transition-colors"
                         >
                             {isLoginView ? 'Register here' : 'Login here'}
