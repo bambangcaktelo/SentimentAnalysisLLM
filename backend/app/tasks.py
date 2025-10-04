@@ -16,27 +16,25 @@ import io
 import base64
 from typing import List, Dict, Any, Optional
 import requests
+import aiohttp
+import feedparser
 
-# async playwright for article scraping (optional/fallback)
-try:
-    from playwright.async_api import async_playwright
-    PLAYWRIGHT_AVAILABLE = True
-except Exception:
-    PLAYWRIGHT_AVAILABLE = False
+# --- MEMORY OPTIMIZATION ---
+# The following libraries are removed to reduce memory consumption on free hosting tiers.
+# The RAG pipeline will use a lightweight fallback instead of local ML models.
+#
+# try:
+#     from sentence_transformers import SentenceTransformer
+# except Exception:
+#     SentenceTransformer = None
+#
+# try:
+#     import faiss
+# except Exception:
+#     faiss = None
+# ---------------------------
 
-# NLP / ML libs
-try:
-    from sentence_transformers import SentenceTransformer
-except Exception:
-    SentenceTransformer = None
-
-try:
-    import faiss
-except Exception:
-    faiss = None
-
-import wikipediaapi
-
+import nest_asyncio
 
 # Wordcloud + NLTK
 from wordcloud import WordCloud
@@ -44,13 +42,15 @@ import nltk
 try:
     nltk.data.find('corpora/stopwords')
 except Exception:
-    nltk.download('stopwords')
+    nltk.download('stopwords', quiet=True) # Added quiet=True to avoid verbose logs
 from nltk.corpus import stopwords
 stop_words = set(stopwords.words('english'))
 
 # Local dependencies (clients + API keys) — keep same names as dependencies.py
 from .dependencies import youtube_client, reddit_client, hf_client, HUGGINGFACE_API_KEY
 
+# Apply nest_asyncio for environments that may already have an event loop (jupyter/others)
+nest_asyncio.apply()
 
 # -----------------------------------------------------------------------------
 # Utilities
@@ -61,11 +61,8 @@ def clean_text(text: Optional[str]) -> str:
     if not isinstance(text, str):
         text = str(text)
     text = html.unescape(text)
-    # Remove HTML tags
     text = re.sub(r'<.*?>', ' ', text)
-    # remove urls
     text = re.sub(r'http\S+|www\.\S+', ' ', text)
-    # keep common punctuation but remove other weird chars
     text = re.sub(r"[^\w\s.,!?\'\"-]", ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
@@ -78,10 +75,6 @@ def normalize_social_output(source: str, id: str, text: str, author: Optional[st
 # -----------------------------------------------------------------------------
 
 async def scrape_youtube_async(query: str, limit: int = 10) -> List[Dict[str, Any]]:
-    """
-    Uses googleapiclient youtube_client (synchronous) but runs in thread.
-    Returns list of normalized items.
-    """
     results = []
     if youtube_client is None:
         print("⚠️ YouTube client is not initialized. Skipping YouTube scraping.")
@@ -120,10 +113,6 @@ async def scrape_youtube_async(query: str, limit: int = 10) -> List[Dict[str, An
         return results
 
 async def scrape_reddit_async(query: str, limit: int = 20) -> List[Dict[str, Any]]:
-    """
-    Uses praw reddit_client (synchronous) but runs in thread.
-    Searches r/all for query and returns posts.
-    """
     results = []
     if reddit_client is None:
         print("⚠️ Reddit client is not initialized. Skipping Reddit scraping.")
@@ -158,26 +147,18 @@ async def scrape_reddit_async(query: str, limit: int = 20) -> List[Dict[str, Any
         traceback.print_exc()
         return results
 
-import aiohttp
-import feedparser
-from bs4 import BeautifulSoup
-
 # -----------------------------------------------------------------------------
 # SECTION: WIKIPEDIA (async REST API)
 # -----------------------------------------------------------------------------
 
 async def fetch_wikipedia_data_async(topic: str, max_links: int = 3, lang: str = "id"):
-    """
-    Fetches summary + linked section snippets from Wikipedia using REST API.
-    Fallback to English if Indonesian not found.
-    """
     results = []
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; SentimentAnalysisApp/1.0)"}
 
     async def fetch_page(session, lang_code, title):
-        url = f"https://{lang_code}.wikipedia.org/api/rest_v1/page/summary/{title}"
-        headers = {"User-Agent": "Mozilla/5.0"}  # <-- FIX: Added User-Agent header
+        url = f"https://{lang_code}.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title)}"
         try:
-            async with session.get(url, timeout=10, headers=headers) as resp: # <-- FIX: Passed headers
+            async with session.get(url, timeout=10, headers=headers) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     extract = data.get("extract", "")
@@ -190,213 +171,108 @@ async def fetch_wikipedia_data_async(topic: str, max_links: int = 3, lang: str =
                             "date": None,
                             "url": data.get("content_urls", {}).get("desktop", {}).get("page", "")
                         }
-        except asyncio.TimeoutError:
-            print(f"[WARN] Wikipedia fetch timeout: {title} ({lang_code})")
         except Exception as e:
             print(f"[WARN] Wikipedia fetch failed for {title} ({lang_code}): {e}")
         return None
 
     async with aiohttp.ClientSession() as session:
-        # Try main topic (Indonesian → English)
-        main_data = await fetch_page(session, lang, topic.replace(" ", "_"))
+        main_data = await fetch_page(session, lang, topic)
         if not main_data:
-            main_data = await fetch_page(session, "en", topic.replace(" ", "_"))
+            main_data = await fetch_page(session, "en", topic)
         if main_data:
             results.append(main_data)
 
-        # Fetch linked pages (use opensearch to find related pages)
         search_url = f"https://{lang}.wikipedia.org/w/api.php?action=opensearch&search={topic}&limit={max_links}&namespace=0&format=json"
-        headers = {"User-Agent": "Mozilla/5.0"} # <-- FIX: Added User-Agent header
         try:
-            async with session.get(search_url, timeout=10, headers=headers) as resp: # <-- FIX: Passed headers
+            async with session.get(search_url, timeout=10, headers=headers) as resp:
                 data = await resp.json()
                 titles = data[1] if len(data) > 1 else []
                 for title in titles:
-                    sub_data = await fetch_page(session, lang, title.replace(" ", "_"))
-                    if sub_data:
-                        results.append(sub_data)
+                    if title.lower() != topic.lower():
+                        sub_data = await fetch_page(session, lang, title)
+                        if sub_data:
+                            results.append(sub_data)
         except Exception as e:
             print(f"[WARN] Wikipedia search failed: {e}")
 
     return results
-
 
 # -----------------------------------------------------------------------------
 # SECTION: GOOGLE NEWS (feedparser + BeautifulSoup)
 # -----------------------------------------------------------------------------
 
 async def fetch_google_news_async(topic: str, max_articles: int = 5, lang: str = "id", region: str = "ID"):
-    """
-    Fetch Google News RSS articles (no Playwright, Windows-safe).
-    """
     encoded_topic = urllib.parse.quote(topic)
     rss_url = f"https://news.google.com/rss/search?q={encoded_topic}&hl={lang}&gl={region}&ceid={region}:{lang}"
-
     results = []
-    feed = feedparser.parse(rss_url, request_headers={"User-Agent": "Mozilla/5.0"})
-    print(f"[DEBUG] Fetched {len(feed.entries)} RSS entries for topic '{topic}'")
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; SentimentAnalysisApp/1.0)"}
+    
+    try:
+        feed = await asyncio.to_thread(feedparser.parse, rss_url, request_headers=headers)
+    except Exception as e:
+        print(f"[ERROR] Failed to parse RSS feed: {e}")
+        return []
 
     async with aiohttp.ClientSession() as session:
         for entry in feed.entries[:max_articles]:
-            link = entry.link
-            title = entry.title
-            source = getattr(getattr(entry, "source", None), "title", "Google News")
-            
-            # ✅ Always initialize text
-            text = ""
-
-            try:
-                async with session.get(link, headers={"User-Agent": "Mozilla/5.0"}, timeout=10) as resp:
-                    if resp.status != 200:
-                        continue
-                    html = await resp.text()
-                    soup = BeautifulSoup(html, "html.parser")
-                    paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
-                    text = " ".join([p for p in paragraphs if len(p) > 50])[:4000]
-            except asyncio.TimeoutError:
-                print(f"[WARN] Timeout fetching article: {link}")
-            except Exception as e:
-                print(f"[WARN] Failed to fetch article '{title}': {e}")
-
-            # ✅ Fallback if text is still empty
-            if not text.strip():
-                text = entry.get("summary", entry.get("description", ""))
-
-            if not text.strip():
-                continue
-
+            text = entry.get("summary", entry.get("description", ""))
             results.append({
-                "title": title,
+                "title": entry.title,
                 "section": "News",
-                "content": text,
-                "source": source,
+                "content": clean_text(text),
+                "source": getattr(getattr(entry, "source", None), "title", "Google News"),
                 "date": getattr(entry, "published", None),
-                "url": link
+                "url": entry.link
             })
     return results
 
-
-
 # -----------------------------------------------------------------------------
-# SECTION D: Sentiment classification (Hugging Face inference via HF router)
+# SECTION D: Sentiment classification (Hugging Face inference via API)
 # -----------------------------------------------------------------------------
 hf_headers = {"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"} if HUGGINGFACE_API_KEY else {}
-PRIMARY_MODEL = "tabularisai/multilingual-sentiment-analysis"
- # multilingual 3-class
-CHUNK_SIZE = 5  # Adjust for API limits
-hf_headers = {"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"}
 
+def map_to_binary_label(preds: list[dict]) -> str:
+    if not preds: return "unknown"
+    preds = sorted(preds, key=lambda x: x["score"], reverse=True)
+    top = preds[0]
+    if top["label"].lower() == "neutral" and len(preds) > 1:
+        top = preds[1]
+    label = top["label"].lower()
+    if "positive" in label: return "positive"
+    if "negative" in label: return "negative"
+    return "unknown"
 
-# 🔹 Function to safely query HF API in chunks with retry
-async def _query_hf_model(model: str, texts: list[str]) -> list:
-    url = f"https://api-inference.huggingface.co/models/{model}"
+async def classify_sentiment_batch(texts: list[str]) -> list[dict]:
+    print(f"--- Running sentiment classification for {len(texts)} texts ---")
     results = []
+    url = "https://api-inference.huggingface.co/models/tabularisai/multilingual-sentiment-analysis"
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=45.0) as client:
         for i, text in enumerate(texts, start=1):
-            clean_text = text.strip()
+            clean_text = (text or "").strip()
             if not clean_text:
-                print(f"[WARN] Skipping empty text #{i}")
                 results.append(None)
                 continue
-
+            
             payload = {"inputs": clean_text}
             try:
                 resp = await client.post(url, headers=hf_headers, json=payload)
                 if resp.status_code == 503:
-                    # model still loading — wait a bit
-                    print("[INFO] Model warming up, retrying...")
                     await asyncio.sleep(5)
                     resp = await client.post(url, headers=hf_headers, json=payload)
                 resp.raise_for_status()
-                results.append(resp.json())
+                data = resp.json()
+
+                preds = data[0] if (data and isinstance(data[0], list)) else data
+                if preds and len(preds) > 0:
+                    binary_label = map_to_binary_label(preds)
+                    results.append({"text": clean_text, "sentiment": binary_label, "confidence": max(p['score'] for p in preds)})
+                else:
+                    results.append(None)
             except Exception as e:
                 print(f"[ERROR] HF API failed for text #{i}: {e}")
                 results.append(None)
     return results
-
-
-# 🔹 Function to map HF model output → binary sentiment
-def map_to_binary_label(preds: list[dict]) -> str:
-    if not preds:
-        return "unknown"
-
-    preds = sorted(preds, key=lambda x: x["score"], reverse=True)
-
-    top = preds[0]
-    if top["label"].lower() == "neutral":
-        for alt in preds[1:]:
-            if "positive" in alt["label"].lower() or "negative" in alt["label"].lower():
-                top = alt
-                break
-
-    label = top["label"].lower()
-    if "positive" in label:
-        return "positive"
-    elif "negative" in label:
-        return "negative"
-    return "unknown"
-
-
-# 🔹 Main classification function
-async def classify_sentiment_batch(texts: list[str]) -> list[dict]:
-    """Classify sentiments for multiple texts and return sentiment + confidence."""
-    print(f"--- Running sentiment classification for {len(texts)} texts ---")
-    results = []
-
-    for i, text in enumerate(texts, start=1):
-        clean_text = (text or "").strip()
-        if not clean_text:
-            print(f"[WARN] Skipping text #{i}: empty or invalid")
-            results.append(None)
-            continue
-
-        try:
-            payload = {"inputs": clean_text}
-            resp = requests.post(
-                f"https://api-inference.huggingface.co/models/tabularisai/multilingual-sentiment-analysis",
-                headers={"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"},
-                json=payload,
-                timeout=30
-            )
-            data = resp.json()
-
-            # Handle retry if empty
-            if not data or isinstance(data, dict):
-                print(f"[WARN] Empty/invalid response for #{i}, retrying...")
-                await asyncio.sleep(2)
-                resp = requests.post(
-                    f"https://api-inference.huggingface.co/models/tabularisai/multilingual-sentiment-analysis",
-                    headers={"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"},
-                    json=payload,
-                    timeout=30
-                )
-                data = resp.json()
-
-            # ✅ Extract predictions safely
-            preds = None
-            if isinstance(data, list):
-                preds = data[0] if isinstance(data[0], list) else data
-            if not preds:
-                print(f"[DEBUG] Skipped text #{i}: {clean_text!r}")
-
-            if preds and len(preds) > 0:
-                binary_label = map_to_binary_label(preds)
-                results.append({
-                    "text": clean_text,
-                    "sentiment": binary_label,
-                    "confidence": max(p['score'] for p in preds)
-                })
-            else:
-                print(f"[WARN] Skipping text #{i} due to missing sentiment")
-                results.append(None)
-
-        except Exception as e:
-            print(f"[ERROR] HF API failed for text #{i}: {e}")
-            results.append(None)
-
-    return results
-
 
 # -----------------------------------------------------------------------------
 # SECTION E: Quantitative analysis (distribution, top words, wordcloud)
@@ -405,14 +281,18 @@ async def classify_sentiment_batch(texts: list[str]) -> list[dict]:
 def perform_text_analysis(docs: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not docs:
         return {"distribution": {}, "top_words": [], "word_cloud": ""}
-    distribution = Counter(doc.get("sentiment", "neutral") for doc in docs)
+    
+    # Filter out docs with unknown sentiment for a cleaner distribution chart
+    filtered_docs = [doc for doc in docs if doc.get("sentiment") and doc.get("sentiment") != "unknown"]
+    distribution = Counter(doc.get("sentiment") for doc in filtered_docs)
+    
     all_text = " ".join(doc.get("text", "") for doc in docs)
     words = [w for w in re.findall(r'\b\w{3,}\b', all_text.lower()) if w not in stop_words]
     top_words = Counter(words).most_common(15)
     word_cloud_image = ""
     if words:
         try:
-            wc = WordCloud(width=800, height=400, background_color='white', max_words=200).generate(" ".join(words[:5000]))
+            wc = WordCloud(width=800, height=400, background_color='white', max_words=100).generate(" ".join(words))
             buf = io.BytesIO()
             wc.to_image().save(buf, format='PNG')
             word_cloud_image = f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
@@ -425,30 +305,30 @@ def perform_text_analysis(docs: List[Dict[str, Any]]) -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 
 async def generate_sentiment_report(query: str, social_results: List[Dict[str, Any]], quantitative_analysis: Dict[str, Any]) -> str:
-    if not hf_client:
-        return "LLM client not initialized."
-    if not social_results:
-        return "Not enough social media data was found."
+    if not hf_client: return "LLM client not initialized."
+    if not social_results: return "Not enough social media data was found to generate a report."
+    
     dist = quantitative_analysis.get("distribution", {})
     total = sum(dist.values()) or 1
     dist_str = ", ".join([f"{c} {s} ({round(c/total*100)}%)" for s, c in dist.items()])
     top_words_str = ", ".join([f"'{w}'" for w, c in quantitative_analysis.get("top_words", [])])
-    # Provide sample posts (top 20)
-    context = "\n".join([f"{i+1}. [{r.get('source').upper()}] ({r.get('sentiment','N/A')}) {r.get('text','')[:250]}" for i, r in enumerate(social_results[:20])])
-    prompt = f"""You are a sentiment analysis expert. Analyze social media posts about \"{query}\" and create a report.
+    context = "\n".join([f"- [{r.get('source').upper()}] ({r.get('sentiment','N/A')}) {r.get('text','')[:200]}" for i, r in enumerate(social_results[:15])])
+    prompt = f"""As a sentiment analyst, write a concise report (250-350 words) on social media discussions about "{query}".
+STRICTLY use only the data below.
 
-**Quantitative Analysis:**
+**Analysis Data:**
 - Sentiment Distribution: {dist_str}
 - Top Keywords: {top_words_str}
 
-**Sample Social Media Posts:**
+**Sample Posts:**
 {context}
 
-Based STRICTLY on the data provided, write a concise sentiment analysis report (300-400 words) including:
-1. Overall Sentiment (use exact distribution above).
-2. Key Themes from the posts and keywords.
-3. A 2-3 sentence conclusion.
-Do not invent reasons or sentiments not present in the data."""
+Your report must include:
+1.  **Overall Sentiment:** State the dominant sentiment based on the distribution.
+2.  **Key Themes:** Identify major topics from the posts and keywords.
+3.  **Conclusion:** A brief 2-sentence summary.
+
+Do not invent information. Your analysis must be grounded in the provided data."""
     try:
         completion = await hf_client.chat.completions.create(model="meta-llama/Meta-Llama-3-8B-Instruct", messages=[{"role":"user","content":prompt}], temperature=0.5, max_tokens=600)
         return completion.choices[0].message.content
@@ -456,22 +336,21 @@ Do not invent reasons or sentiments not present in the data."""
         return f"Sentiment report generation failed: {e}"
 
 async def generate_reasoning_report(query: str, news_wiki_results: List[Dict[str, Any]]) -> str:
-    if not hf_client:
-        return "LLM client not initialized."
-    if not news_wiki_results:
-        return "Not enough news or articles were found."
-    # Build context
-    context = "\n".join([f"{i+1}. [{r.get('source')}] {r.get('title', r.get('section',''))}\n{r.get('content','')[:400]}\n" for i, r in enumerate(news_wiki_results[:30])])
-    prompt = f"""You are a political/situational analysis expert. Explain the context behind discussions about \"{query}\" based on the provided news and background.
+    if not hf_client: return "LLM client not initialized."
+    if not news_wiki_results: return "Not enough news or articles were found to generate a report."
 
+    context = "\n".join([f"- SOURCE: {r.get('source')}\n  CONTENT: {r.get('content','')[:400]}\n" for r in news_wiki_results[:15]])
+    prompt = f"""As an analyst, explain the context behind discussions about "{query}" using ONLY the provided news and articles.
+
+**Sources:**
 {context}
 
-Write an analytical report (400-500 words) explaining:
-1. Background Context & Recent Developments
-2. Underlying Political/Social Factors
-3. Different Perspectives & Implications
+Write a report (300-400 words) explaining:
+1.  **Background:** What are the key events or context?
+2.  **Key Factors:** What are the underlying social or political drivers?
+3.  **Conclusion:** A brief summary of the situation.
 
-Base your analysis ONLY on the sources provided."""
+Base your analysis ONLY on the text provided. Do not add external information."""
     try:
         completion = await hf_client.chat.completions.create(model="meta-llama/Meta-Llama-3-8B-Instruct", messages=[{"role":"user","content":prompt}], temperature=0.7, max_tokens=800)
         return completion.choices[0].message.content
@@ -479,176 +358,89 @@ Base your analysis ONLY on the sources provided."""
         return f"Reasoning generation failed: {e}"
 
 # -----------------------------------------------------------------------------
-# SECTION G: RAG selection + Orchestration
+# SECTION G: RAG selection + Orchestration (MODIFIED FOR LOW MEMORY)
 # -----------------------------------------------------------------------------
 
 async def rag_pipeline_and_sentiment_analysis(query: str, total_limit: int = 20, k: int = 8):
     """
-    Collect social media (Reddit + YouTube) -> classify sentiments -> build embeddings -> faiss search to pick relevant docs
-    Returns: relevant_docs, all_social_docs
+    MODIFIED FOR LOW MEMORY:
+    - Collects social media posts.
+    - Classifies sentiments via API.
+    - Selects relevant documents by sorting by sentiment confidence instead of using local ML models.
     """
     # 1) Collect social posts
     print(f"--- Starting social scrapers for: {query}")
     try:
         yt_task = scrape_youtube_async(query, limit=total_limit//2 or total_limit)
         rd_task = scrape_reddit_async(query, limit=total_limit//2 or total_limit)
-        # <-- FIX: Removed the un-awaited call to scrape_google_search_async
         resp = await asyncio.gather(yt_task, rd_task)
-        all_social = []
-        for sub in resp:
-            all_social.extend(sub or [])
+        all_social = [item for sublist in resp for item in sublist]
     except Exception as e:
         print(f"--- [ERROR] Social collection failed: {e}")
-        traceback.print_exc()
         all_social = []
 
-    # ensure limit
     all_social = all_social[:total_limit]
 
-    # 2) classify sentiments in-place
+    # 2) Classify sentiments in-place
     texts = [d.get("text", "") for d in all_social]
     sentiment_results = await classify_sentiment_batch(texts)
 
     for doc, sent in zip(all_social, sentiment_results):
         if sent:
             doc["sentiment"] = sent["sentiment"]
-            doc["confidence"] = sent["confidence"]
+            doc["confidence"] = sent.get("confidence", 0.0)
 
-
-    # 3) Prepare embeddings and FAISS
+    # 3) --- MEMORY OPTIMIZATION ---
+    # Instead of using sentence-transformers and faiss, we use a lightweight relevance heuristic.
+    # We sort the documents by their sentiment confidence score, assuming more confident
+    # classifications are more relevant to the core topic.
     valid_docs = [d for d in all_social if d.get("text","").strip()]
     if not valid_docs:
         return [], all_social
 
-    if SentenceTransformer is None:
-        print("⚠️ sentence-transformers not available; returning all docs as relevant fallback.")
-        return valid_docs[:k], all_social
-
-    embedder = SentenceTransformer("all-MiniLM-L6-v2")
-    texts_for_rag = [clean_text(d.get("text","")) for d in valid_docs]
-    embeddings = await asyncio.to_thread(embedder.encode, texts_for_rag, convert_to_numpy=True)
-
-    if faiss is None:
-        print("⚠️ faiss not available; returning top-k docs by naive heuristic (confidence).")
-        # fallback: sort by confidence then return top k
-        sorted_docs = sorted(valid_docs, key=lambda x: x.get("confidence",0.0), reverse=True)
-        return sorted_docs[:k], all_social
-
-    try:
-        dim = embeddings.shape[1]
-        index = faiss.IndexFlatL2(dim)
-        index.add(embeddings.astype('float32'))
-        query_emb = await asyncio.to_thread(embedder.encode, [query], convert_to_numpy=True)
-        k_adjusted = min(k, len(valid_docs))
-        _, indices = index.search(query_emb.astype('float32'), k_adjusted)
-        relevant_docs = [valid_docs[i] for i in indices[0] if i < len(valid_docs)]
-    except Exception as e:
-        print(f"--- [ERROR] FAISS or embedding search failed: {e}")
-        traceback.print_exc()
-        # fallback
-        relevant_docs = valid_docs[:k]
+    print("✅ Using lightweight relevance sorting (no local embeddings).")
+    sorted_docs = sorted(valid_docs, key=lambda x: x.get("confidence", 0.0), reverse=True)
+    relevant_docs = sorted_docs[:k]
+    
     return relevant_docs, all_social
-
-# Helper: google search scraping fallback (lightweight, used optionally)
-from requests_html import AsyncHTMLSession
-async def scrape_google_search_async(query: str, limit: int = 20) -> List[Dict[str, Any]]:
-    """
-    Lightweight Google search scraping (used optionally). Not primary for sentiment/ reasoning in this architecture.
-    """
-    results = []
-    if limit <= 0:
-        return results
-    session = AsyncHTMLSession()
-    url = f'https://www.google.com/search?q={urllib.parse.quote_plus(query)}'
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    try:
-        r = await session.get(url, headers=headers)
-        r.raise_for_status()
-        search_results = r.html.find('div.g')
-        count = 0
-        for result in search_results:
-            if count >= limit:
-                break
-            title_elem = result.find('h3', first=True)
-            link_elem = result.find('a', first=True)
-            snippet_elem = result.find('div[data-sncf="2"]', first=True) or result.find('.VwiC3b', first=True)
-            if title_elem and link_elem:
-                title = title_elem.text or ""
-                link = link_elem.attrs.get('href', '')
-                snippet = snippet_elem.text if snippet_elem else ""
-                combined = title + " " + snippet
-                results.append(normalize_social_output("google_search", f"google_{count}", combined, None, datetime.date.today(), link))
-                count += 1
-    except Exception as e:
-        print(f"--- [WARN] Google search scraping failed: {e}")
-    finally:
-        try:
-            await session.close()
-        except Exception:
-            pass
-    return results
 
 # -----------------------------------------------------------------------------
 # SECTION H: Full pipeline orchestration (used by main.py)
 # -----------------------------------------------------------------------------
 
 async def run_news_wiki_scraper_async(query: str, total_limit: int = 10) -> list:
-    """
-    Collects background info from Wikipedia + Google News (async, Windows-safe).
-    """
     print(f"--- Starting News+Wiki scrape for: '{query}' ---")
     try:
         wiki_task = fetch_wikipedia_data_async(query, max_links=3)
         news_task = fetch_google_news_async(query, max_articles=total_limit)
         wiki_data, news_data = await asyncio.gather(wiki_task, news_task)
-        combined = wiki_data + news_data
-        print(f"--- Completed News+Wiki scrape: {len(combined)} items ---")
-        return combined
+        return (wiki_data or []) + (news_data or [])
     except Exception as e:
         print(f"--- [ERROR] News+Wiki scrape failed: {e} ---")
         return []
 
-
 async def run_social_scraper_async(query: str, total_limit: int = 20) -> List[Dict[str, Any]]:
-    """
-    Collect social media sources (YouTube + Reddit) — this is the primary data for sentiment report
-    """
     try:
-        # divide between youtube and reddit roughly
         yt_limit = max(1, total_limit // 2)
         rd_limit = max(1, total_limit - yt_limit)
         yt_task = scrape_youtube_async(query, limit=yt_limit)
         rd_task = scrape_reddit_async(query, limit=rd_limit)
         yt_res, rd_res = await asyncio.gather(yt_task, rd_task)
-        combined = (yt_res or []) + (rd_res or [])
-        # trim and return
-        return combined[:total_limit]
+        return (yt_res or []) + (rd_res or [])
     except Exception as e:
         print(f"--- [ERROR] run_social_scraper_async crashed: {e}")
-        traceback.print_exc()
         return []
 
 async def run_full_analysis_pipeline(query: str, total_limit: int = 20, k: int = 8):
-    """
-    The main entrypoint used by your FastAPI background task.
-    - Collects social media (for sentiment) and news/wiki (for reasoning).
-    - Runs sentiment classification on social.
-    - Performs quantitative analysis and LLM sentiment report.
-    - Prepares RAG relevant docs (social) and returns assembled result dict.
-    """
     print(f"\n{'='*60}\nFULL ANALYSIS PIPELINE START: {query}\n{'='*60}\n")
-    # Phase 1: data collection (parallel)
-    social_task = rag_pipeline_and_sentiment_analysis(query, total_limit=total_limit, k=k)  # includes collect + classify + rag
-    news_wiki_task = run_news_wiki_scraper_async(query, total_limit=total_limit)
+    social_task = rag_pipeline_and_sentiment_analysis(query, total_limit=total_limit, k=k)
+    news_wiki_task = run_news_wiki_scraper_async(query, total_limit=10) # Reduced limit
     (relevant_social_docs, all_social_docs), news_wiki_results = await asyncio.gather(social_task, news_wiki_task)
 
     print(f"✓ Data Collection: {len(all_social_docs)} social items, {len(news_wiki_results)} news/wiki items")
-    # Phase 2: Quantitative analysis (on all social docs)
     quantitative_analysis = perform_text_analysis(all_social_docs)
-    # Phase 3: Sentiment report generation (social only)
     sentiment_report = await generate_sentiment_report(query, all_social_docs, quantitative_analysis)
-    # Phase 4: reasoning (news + wiki) report — not auto-generated here, left to endpoint call to conserve quota
-    # Build final result object
+    
     result = {
         "query": query,
         "sentiment_report": sentiment_report,
@@ -661,61 +453,31 @@ async def run_full_analysis_pipeline(query: str, total_limit: int = 20, k: int =
     }
     print(f"\n{'='*60}\nPIPELINE COMPLETED: {query}\n{'='*60}\n")
     return result
+
 # -----------------------------------------------------------------------------
 # SECTION I: Chat Response (LLM Q&A using reports)
 # -----------------------------------------------------------------------------
 
 async def generate_chat_response(analysis_context: dict, chat_history: list) -> str:
-    """
-    Generates a chat-style response using full analysis context:
-    - Sentiment report (social media summary)
-    - Reasoning report (news/wiki summary)
-    - All social docs (raw posts + sentiments)
-    - News/wiki docs (raw content)
-    """
-    if not hf_client:
-        return "Chat functionality is disabled (no Hugging Face client)."
+    if not hf_client: return "Chat functionality is disabled (no Hugging Face client)."
 
     query = analysis_context.get('query', 'the topic')
     sentiment_report = analysis_context.get('sentiment_report', 'N/A')
     reasoning_report = analysis_context.get('reasoning_report', 'N/A')
-    social_docs = analysis_context.get('all_social_docs', [])
-    news_wiki_docs = analysis_context.get('rag2_results', [])
+    
+    system_prompt = f"""You are an AI analyst explaining insights about "{query}".
+Use the provided reports to answer questions factually.
 
-    # 🧠 Build detailed context
-    social_examples = "\n".join([
-        f"- ({d.get('sentiment', 'N/A').upper()}) {d.get('text', '')[:180]}"
-        for d in social_docs[:8]
-    ]) or "No social data available."
-
-    news_examples = "\n".join([
-        f"- [{d.get('source', 'Unknown')}] {d.get('title', d.get('section', ''))}: {d.get('content', '')[:180]}"
-        for d in news_wiki_docs[:6]
-    ]) or "No news/wiki data available."
-
-    # 🧩 System prompt combines all sources
-    system_prompt = f"""
-You are an AI analyst explaining insights about "{query}".
-Use the provided reports AND raw data below to answer questions factually.
-
-📊 SENTIMENT REPORT (Summary):
+📊 SENTIMENT REPORT (Summary of Social Media):
 {sentiment_report}
 
-📰 REASONING REPORT (News/Wiki Summary):
+📰 REASONING REPORT (Summary of News/Wiki):
 {reasoning_report}
 
-💬 SOCIAL MEDIA DATA (Posts + Sentiment):
-{social_examples}
+Answer the user's question based **only** on these reports.
+If the information is not in the reports, state that clearly.
+Be concise and stay grounded in the provided context."""
 
-🧭 NEWS/WIKI DATA (Context):
-{news_examples}
-
-Answer **only** based on these sources.
-If information is missing, say so clearly. 
-Be detailed but grounded in the provided context.
-"""
-
-    # Combine with user chat history
     messages = [{"role": "system", "content": system_prompt}] + chat_history
 
     try:
@@ -733,10 +495,14 @@ Be detailed but grounded in the provided context.
 # If run as script for quick debugging
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    import asyncio, json, os, argparse
+    import json, os, argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--q", required=True, help="Query to analyze")
     parser.add_argument("--limit", type=int, default=20)
     args = parser.parse_args()
     res = asyncio.run(run_full_analysis_pipeline(args.q, total_limit=args.limit))
-    print(json.dumps({"query": args.q, "social_count": len(res.get("all_social_docs", [])), "sentiment_report_present": bool(res.get("sentiment_report"))}, indent=2))
+    print(json.dumps({
+        "query": args.q, 
+        "social_count": len(res.get("all_social_docs", [])), 
+        "sentiment_report_present": bool(res.get("sentiment_report"))
+    }, indent=2))

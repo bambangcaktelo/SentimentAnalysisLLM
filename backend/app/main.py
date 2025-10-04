@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, EmailStr
 from typing import List, Dict, Any, Optional
 from fastapi_mail import ConnectionConfig, FastMail, MessageSchema
 from dotenv import load_dotenv
@@ -30,7 +30,7 @@ DAILY_LIMIT = 5
 app = FastAPI(
     title="Sentiment Analysis API",
     description="An API for sentiment analysis with user accounts and history management.",
-    version="4.4.0" # Version bump
+    version="4.6.0" # Version bump for new login feature
 )
 
 # --- CORS Configuration ---
@@ -71,7 +71,7 @@ class UserCreate(BaseModel):
     password: str
 
 class TokenRequest(BaseModel):
-    username: str
+    identifier: str # Can be username or email
     password: str
     
 class ForgotPasswordRequest(BaseModel):
@@ -105,7 +105,7 @@ class ChatResponse(BaseModel):
 async def run_analysis_background(query: str, job_id: str):
     print(f"Background task {job_id} started for query: '{query}'")
     try:
-        result_data = await run_full_analysis_pipeline(query)   # ✅ await async pipeline
+        result_data = await run_full_analysis_pipeline(query)
         await results_store_collection.update_one(
             {"job_id": job_id},
             {"$set": {"status": "completed", "result": result_data}}
@@ -117,8 +117,6 @@ async def run_analysis_background(query: str, job_id: str):
             {"job_id": job_id},
             {"$set": {"status": "failed", "result": {"error": str(e)}}}
         )
-
-
 
 # --- Quota Management Dependency ---
 async def check_and_update_limit(current_user: dict = Depends(get_current_user)):
@@ -174,11 +172,17 @@ async def register(user: UserCreate, background_tasks: BackgroundTasks):
 
 @app.post("/token", response_model=Token, tags=["Auth"])
 async def login_for_access_token(form_data: TokenRequest):
-    user = await users_collection.find_one({"username": form_data.username})
+    # Check if the identifier is an email or a username
+    if "@" in form_data.identifier:
+        user = await users_collection.find_one({"email": form_data.identifier})
+    else:
+        user = await users_collection.find_one({"username": form_data.identifier})
+    
     if not user or not verify_password(form_data.password, user["hashed_password"]):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect username or password")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect username/email or password")
     if not user.get("is_verified"):
         raise HTTPException(status_code=403, detail="Account not verified. Please check your email.")
+    
     access_token = create_access_token(data={"sub": user["username"]})
     return {"access_token": access_token, "token_type": "bearer"}
 
@@ -281,7 +285,7 @@ async def get_task_status(job_id: str, current_user: dict = Depends(get_current_
     return {"job_id": job_id, "status": result["status"], "result": result.get("result"), "questions_remaining": questions_remaining}
 
 @app.post("/generate-reasoning/{job_id}", status_code=200, tags=["Analysis"])
-async def start_reasoning_generation(job_id: str, current_user: dict = Depends(get_current_user), questions_remaining: int = Depends(check_and_update_limit)):
+async def start_reasoning_generation(job_id: str, current_user: dict = Depends(get_current_user)):
     analysis_data = await results_store_collection.find_one({"job_id": job_id, "owner": current_user["username"]})
     if not analysis_data or analysis_data["status"] != "completed":
         raise HTTPException(status_code=404, detail="Completed analysis not found.")
@@ -304,5 +308,6 @@ async def handle_chat(job_id: str, chat_request: ChatRequest, current_user: dict
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))  # Render assigns PORT env var
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+
