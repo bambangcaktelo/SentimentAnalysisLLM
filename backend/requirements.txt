@@ -20,3 +20,4 @@ nltk==3.8.1
 wordcloud==1.9.3
 numpy==1.26.4
 Pillow==10.3.0
+argon2-cffi==23.1.0
