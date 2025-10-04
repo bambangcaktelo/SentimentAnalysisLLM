@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, Field, EmailStr, validator
 from typing import List, Dict, Any, Optional
 from fastapi_mail import ConnectionConfig, FastMail, MessageSchema
 from dotenv import load_dotenv
@@ -30,7 +30,7 @@ DAILY_LIMIT = 5
 app = FastAPI(
     title="Sentiment Analysis API",
     description="An API for sentiment analysis with user accounts and history management.",
-    version="4.6.0" # Version bump for new login feature
+    version="4.5.0"
 )
 
 # --- CORS Configuration ---
@@ -43,6 +43,7 @@ app.add_middleware(
 )
 
 # --- Email Configuration ---
+# ... (Email config remains the same)
 conf = ConnectionConfig(
     MAIL_USERNAME=os.getenv("MAIL_USERNAME"),
     MAIL_PASSWORD=os.getenv("MAIL_PASSWORD"),
@@ -54,8 +55,8 @@ conf = ConnectionConfig(
     USE_CREDENTIALS=True,
     VALIDATE_CERTS=True
 )
-
 fm = FastMail(conf)
+
 
 # --- Pydantic Models ---
 class ChatMessage(BaseModel):
@@ -71,9 +72,9 @@ class UserCreate(BaseModel):
     password: str
 
 class TokenRequest(BaseModel):
-    identifier: str # Can be username or email
+    login_identifier: str  # Can be username or email
     password: str
-    
+
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
 
@@ -101,6 +102,12 @@ class ChatResponse(BaseModel):
     response: str
     questions_remaining: int
 
+# --- Health Check Endpoint (NEW) ---
+@app.get("/", tags=["Health Check"])
+async def read_root():
+    return {"status": "API is running"}
+
+
 # --- Background Task Wrapper ---
 async def run_analysis_background(query: str, job_id: str):
     print(f"Background task {job_id} started for query: '{query}'")
@@ -124,15 +131,16 @@ async def check_and_update_limit(current_user: dict = Depends(get_current_user))
     user = await users_collection.find_one({"username": username})
     today_utc = datetime.now(timezone.utc).date()
 
-    last_prompt = user.get("last_prompt_date")
-    last_prompt_date = last_prompt.date() if isinstance(last_prompt, datetime) else None
+    last_prompt_date = user.get("last_prompt_date")
+    if last_prompt_date:
+        last_prompt_date = last_prompt_date.date()
 
     if not last_prompt_date or last_prompt_date != today_utc:
         await users_collection.update_one({"username": username}, {"$set": {"prompt_count": 0}})
         user["prompt_count"] = 0
 
     if user.get("prompt_count", 0) >= DAILY_LIMIT:
-        raise HTTPException(status_code=429, detail=f"Daily limit of {DAILY_LIMIT} reasoning prompts reached.")
+        raise HTTPException(status_code=429, detail=f"Daily limit of {DAILY_LIMIT} prompts reached.")
 
     new_count = user.get("prompt_count", 0) + 1
     await users_collection.update_one(
@@ -140,6 +148,7 @@ async def check_and_update_limit(current_user: dict = Depends(get_current_user))
         {"$set": {"prompt_count": new_count, "last_prompt_date": datetime.now(timezone.utc)}}
     )
     return DAILY_LIMIT - new_count
+
 
 # --- Authentication Endpoints ---
 @app.post("/register", status_code=status.HTTP_201_CREATED, tags=["Auth"])
@@ -172,20 +181,20 @@ async def register(user: UserCreate, background_tasks: BackgroundTasks):
 
 @app.post("/token", response_model=Token, tags=["Auth"])
 async def login_for_access_token(form_data: TokenRequest):
-    # Check if the identifier is an email or a username
-    if "@" in form_data.identifier:
-        user = await users_collection.find_one({"email": form_data.identifier})
-    else:
-        user = await users_collection.find_one({"username": form_data.identifier})
-    
+    user = await users_collection.find_one({
+        "$or": [
+            {"username": form_data.login_identifier},
+            {"email": form_data.login_identifier}
+        ]
+    })
     if not user or not verify_password(form_data.password, user["hashed_password"]):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect username/email or password")
     if not user.get("is_verified"):
         raise HTTPException(status_code=403, detail="Account not verified. Please check your email.")
-    
     access_token = create_access_token(data={"sub": user["username"]})
     return {"access_token": access_token, "token_type": "bearer"}
 
+# ... (Other endpoints remain the same)
 @app.post("/verify-email", tags=["Auth"])
 async def verify_email(token: str):
     username = verify_special_token(token, "email_verification")
@@ -277,8 +286,10 @@ async def get_task_status(job_id: str, current_user: dict = Depends(get_current_
     
     user = await users_collection.find_one({"username": current_user["username"]})
     today_utc = datetime.now(timezone.utc).date()
-    last_prompt = user.get("last_prompt_date")
-    last_prompt_date = last_prompt.date() if isinstance(last_prompt, datetime) else None
+    last_prompt_date = user.get("last_prompt_date")
+    if last_prompt_date:
+        last_prompt_date = last_prompt_date.date()
+
     current_prompt_count = user.get("prompt_count", 0) if last_prompt_date and last_prompt_date == today_utc else 0
     questions_remaining = DAILY_LIMIT - current_prompt_count
     
