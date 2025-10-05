@@ -6,7 +6,7 @@ import base64
 from datetime import datetime, timezone
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, EmailStr
 from typing import List, Dict, Any
 from fastapi_mail import ConnectionConfig, FastMail, MessageSchema
 from dotenv import load_dotenv
@@ -14,6 +14,7 @@ from email.mime.text import MIMEText
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
+# --- Load Environment Variables ---
 load_dotenv()
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
@@ -31,7 +32,7 @@ from .auth import (
     PASSWORD_RESET_TOKEN_EXPIRE_MINUTES
 )
 
-# --- SETUP LOGGING ---
+# --- Logging Setup ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -40,13 +41,14 @@ logging.basicConfig(
 
 DAILY_LIMIT = 5
 
+# --- FastAPI App ---
 app = FastAPI(
-    title="Sentiment Analysis API",
-    description="An API for sentiment analysis with user accounts and history management.",
-    version="4.6.0"
+    title="Sentiment Insight API",
+    description="An API for sentiment analysis with user authentication, email verification, and history management.",
+    version="5.0.0"
 )
 
-# --- CORS Configuration ---
+# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -55,7 +57,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Email Config (Two modes: SMTP for local, Gmail API for Render) ---
+# --- Email Configuration ---
 USE_GMAIL_API = os.getenv("USE_GMAIL_API", "false").lower() == "true"
 
 if not USE_GMAIL_API:
@@ -83,8 +85,8 @@ if not USE_GMAIL_API:
         logging.error(f"Failed to create FastMail instance: {e}", exc_info=True)
 
 
-# --- Gmail API sender (used in production) ---
-async def send_gmail_api(to_email: str, subject: str, body: str):
+# --- Gmail API Sender ---
+async def send_gmail_api(to_email: str, subject: str, html_body: str):
     creds = Credentials(
         None,
         refresh_token=os.getenv("GMAIL_REFRESH_TOKEN"),
@@ -94,13 +96,55 @@ async def send_gmail_api(to_email: str, subject: str, body: str):
     )
     service = build("gmail", "v1", credentials=creds)
 
-    message = MIMEText(body, "html")
+    message = MIMEText(html_body, "html")
     message["to"] = to_email
     message["from"] = os.getenv("GMAIL_USER")
     message["subject"] = subject
 
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
     return service.users().messages().send(userId="me", body={"raw": raw}).execute()
+
+
+# --- Email Templates ---
+def build_verification_email(username: str, verification_link: str) -> str:
+    return f"""
+    <html>
+      <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+        <h2>Welcome to Sentiment Insight, {username}!</h2>
+        <p>Thank you for signing up. To complete your registration, please verify your email address.</p>
+        <p>
+          <a href="{verification_link}" 
+             style="display:inline-block;padding:10px 20px;background-color:#007BFF;color:#fff;text-decoration:none;border-radius:4px;">
+             Verify My Email
+          </a>
+        </p>
+        <p>If you didn’t create an account, you can safely ignore this message.</p>
+        <hr/>
+        <small>This message was sent automatically by Sentiment Insight. Please do not reply.</small>
+      </body>
+    </html>
+    """
+
+
+def build_reset_password_email(username: str, reset_link: str) -> str:
+    return f"""
+    <html>
+      <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+        <h2>Password Reset Request</h2>
+        <p>Hello {username},</p>
+        <p>We received a request to reset your password. Click the button below to create a new one:</p>
+        <p>
+          <a href="{reset_link}" 
+             style="display:inline-block;padding:10px 20px;background-color:#28A745;color:#fff;text-decoration:none;border-radius:4px;">
+             Reset My Password
+          </a>
+        </p>
+        <p>If you didn’t request this, you can safely ignore this email. Your password will remain unchanged.</p>
+        <hr/>
+        <small>This message was sent automatically by Sentiment Insight. Please do not reply.</small>
+      </body>
+    </html>
+    """
 
 
 # --- Pydantic Models ---
@@ -148,13 +192,13 @@ class ChatResponse(BaseModel):
     questions_remaining: int
 
 
-# --- Health Check Endpoint ---
+# --- Health Check ---
 @app.get("/", tags=["Health Check"])
 async def read_root():
     return {"status": "API is running"}
 
 
-# --- Background Task Wrapper ---
+# --- Background Task ---
 async def run_analysis_background(query: str, job_id: str):
     logging.info(f"Background task {job_id} started for query: '{query}'")
     try:
@@ -172,7 +216,7 @@ async def run_analysis_background(query: str, job_id: str):
         )
 
 
-# --- Quota Management Dependency ---
+# --- Quota Management ---
 async def check_and_update_limit(current_user: dict = Depends(get_current_user)):
     username = current_user["username"]
     user = await users_collection.find_one({"username": username})
@@ -197,7 +241,7 @@ async def check_and_update_limit(current_user: dict = Depends(get_current_user))
     return DAILY_LIMIT - new_count
 
 
-# --- Authentication Endpoints ---
+# --- Auth Endpoints ---
 @app.post("/register", status_code=status.HTTP_201_CREATED, tags=["Auth"])
 async def register(user: UserCreate, background_tasks: BackgroundTasks):
     if await users_collection.find_one({"username": user.username}):
@@ -217,16 +261,15 @@ async def register(user: UserCreate, background_tasks: BackgroundTasks):
 
     token = create_special_token(user.username, "email_verification", EMAIL_VERIFICATION_TOKEN_EXPIRE_MINUTES)
     verification_link = f"{FRONTEND_URL}/verify-email?token={token}"
-    logging.info(f"Attempting to send verification email to {user.email}")
+    html_content = build_verification_email(user.username, verification_link)
 
     if USE_GMAIL_API:
-        background_tasks.add_task(send_gmail_api, user.email, "Verify Your Account",
-                                  f"Please click the link to verify your account: {verification_link}")
+        background_tasks.add_task(send_gmail_api, user.email, "Verify Your Sentiment Insight Account", html_content)
     else:
         message = MessageSchema(
-            subject="Verify Your Account",
+            subject="Verify Your Sentiment Insight Account",
             recipients=[user.email],
-            body=f"Please click the link to verify your account: {verification_link}",
+            body=html_content,
             subtype="html"
         )
         background_tasks.add_task(fm.send_message, message)
@@ -267,13 +310,16 @@ async def forgot_password(request: ForgotPasswordRequest, background_tasks: Back
     if user:
         token = create_special_token(user["username"], "password_reset", PASSWORD_RESET_TOKEN_EXPIRE_MINUTES)
         reset_link = f"{FRONTEND_URL}/reset-password?token={token}"
+        html_content = build_reset_password_email(user["username"], reset_link)
+
         if USE_GMAIL_API:
-            background_tasks.add_task(send_gmail_api, request.email, "Password Reset Request",
-                                      f"Click the link to reset your password: {reset_link}")
+            background_tasks.add_task(send_gmail_api, request.email, "Reset Your Sentiment Insight Password", html_content)
         else:
             message = MessageSchema(
-                subject="Password Reset Request", recipients=[request.email],
-                body=f"Click the link to reset your password: {reset_link}", subtype="html"
+                subject="Reset Your Sentiment Insight Password",
+                recipients=[request.email],
+                body=html_content,
+                subtype="html"
             )
             background_tasks.add_task(fm.send_message, message)
     return {"message": "If an account with that email exists, a password reset link has been sent."}
@@ -384,11 +430,18 @@ async def handle_chat(job_id: str, chat_request: ChatRequest, current_user: dict
     chat_history_for_llm = [msg.dict() for msg in chat_request.messages]
     ai_response = await generate_chat_response(analysis_data["result"], chat_history_for_llm)
     new_chat_history = chat_history_for_llm + [{"role": "assistant", "content": ai_response}]
-    await results_store_collection.update_one({"job_id": job_id}, {"$set": {"result.chat_history": new_chat_history}})
+    
+    await results_store_collection.update_one(
+        {"job_id": job_id},
+        {"$set": {"result.chat_history": new_chat_history}}
+    )
+    
     return ChatResponse(response=ai_response, questions_remaining=questions_remaining)
 
 
+# --- App Runner ---
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+
