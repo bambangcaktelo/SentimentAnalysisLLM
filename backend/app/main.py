@@ -2,13 +2,17 @@ import os
 import uuid
 import logging
 import sys
+import base64
 from datetime import datetime, timezone
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, EmailStr, validator
-from typing import List, Dict, Any, Optional
+from pydantic import BaseModel, Field, EmailStr
+from typing import List, Dict, Any
 from fastapi_mail import ConnectionConfig, FastMail, MessageSchema
 from dotenv import load_dotenv
+from email.mime.text import MIMEText
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
 
 load_dotenv()
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
@@ -28,20 +32,18 @@ from .auth import (
 )
 
 # --- SETUP LOGGING ---
-# Ensures logs are sent to the console/Render's log stream
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     stream=sys.stdout
 )
 
-
 DAILY_LIMIT = 5
 
 app = FastAPI(
     title="Sentiment Analysis API",
     description="An API for sentiment analysis with user accounts and history management.",
-    version="4.5.0"
+    version="4.6.0"
 )
 
 # --- CORS Configuration ---
@@ -53,32 +55,52 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Email Configuration ---
-# Create a dictionary of the configuration from environment variables
-conf_dict = {
-    "MAIL_USERNAME": os.getenv("MAIL_USERNAME"),
-    "MAIL_PASSWORD": os.getenv("MAIL_PASSWORD"),
-    "MAIL_FROM": os.getenv("MAIL_FROM"),
-    "MAIL_PORT": int(os.getenv("MAIL_PORT", 465)),
-    "MAIL_SERVER": os.getenv("MAIL_SERVER"),
-    "MAIL_STARTTLS": os.getenv("MAIL_STARTTLS", "False").lower() == "true", # Correct default for port 465
-    "MAIL_SSL_TLS": os.getenv("MAIL_SSL_TLS", "True").lower() == "true",   # Correct default for port 465
-    "USE_CREDENTIALS": True,
-    "VALIDATE_CERTS": True
-}
+# --- Email Config (Two modes: SMTP for local, Gmail API for Render) ---
+USE_GMAIL_API = os.getenv("USE_GMAIL_API", "false").lower() == "true"
 
-# --- Log the configuration safely upon application startup ---
-log_conf = conf_dict.copy()
-if log_conf.get("MAIL_PASSWORD"):
-    log_conf["MAIL_PASSWORD"] = "**********" # Mask the password for security
-logging.info(f"FastMail configuration loaded: {log_conf}")
+if not USE_GMAIL_API:
+    conf_dict = {
+        "MAIL_USERNAME": os.getenv("MAIL_USERNAME"),
+        "MAIL_PASSWORD": os.getenv("MAIL_PASSWORD"),
+        "MAIL_FROM": os.getenv("MAIL_FROM"),
+        "MAIL_PORT": int(os.getenv("MAIL_PORT", 465)),
+        "MAIL_SERVER": os.getenv("MAIL_SERVER"),
+        "MAIL_STARTTLS": os.getenv("MAIL_STARTTLS", "False").lower() == "true",
+        "MAIL_SSL_TLS": os.getenv("MAIL_SSL_TLS", "True").lower() == "true",
+        "USE_CREDENTIALS": True,
+        "VALIDATE_CERTS": True
+    }
+    log_conf = conf_dict.copy()
+    if log_conf.get("MAIL_PASSWORD"):
+        log_conf["MAIL_PASSWORD"] = "**********"
+    logging.info(f"FastMail configuration loaded: {log_conf}")
 
-try:
-    conf = ConnectionConfig(**conf_dict)
-    fm = FastMail(conf)
-    logging.info("FastMail instance created successfully.")
-except Exception as e:
-    logging.error(f"Failed to create FastMail instance: {e}", exc_info=True)
+    try:
+        conf = ConnectionConfig(**conf_dict)
+        fm = FastMail(conf)
+        logging.info("FastMail instance created successfully.")
+    except Exception as e:
+        logging.error(f"Failed to create FastMail instance: {e}", exc_info=True)
+
+
+# --- Gmail API sender (used in production) ---
+async def send_gmail_api(to_email: str, subject: str, body: str):
+    creds = Credentials(
+        None,
+        refresh_token=os.getenv("GMAIL_REFRESH_TOKEN"),
+        client_id=os.getenv("GMAIL_CLIENT_ID"),
+        client_secret=os.getenv("GMAIL_CLIENT_SECRET"),
+        token_uri="https://oauth2.googleapis.com/token"
+    )
+    service = build("gmail", "v1", credentials=creds)
+
+    message = MIMEText(body, "html")
+    message["to"] = to_email
+    message["from"] = os.getenv("GMAIL_USER")
+    message["subject"] = subject
+
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+    return service.users().messages().send(userId="me", body={"raw": raw}).execute()
 
 
 # --- Pydantic Models ---
@@ -95,7 +117,7 @@ class UserCreate(BaseModel):
     password: str
 
 class TokenRequest(BaseModel):
-    login_identifier: str  # Can be username or email
+    login_identifier: str
     password: str
 
 class ForgotPasswordRequest(BaseModel):
@@ -125,6 +147,7 @@ class ChatResponse(BaseModel):
     response: str
     questions_remaining: int
 
+
 # --- Health Check Endpoint ---
 @app.get("/", tags=["Health Check"])
 async def read_root():
@@ -147,6 +170,7 @@ async def run_analysis_background(query: str, job_id: str):
             {"job_id": job_id},
             {"$set": {"status": "failed", "result": {"error": str(e)}}}
         )
+
 
 # --- Quota Management Dependency ---
 async def check_and_update_limit(current_user: dict = Depends(get_current_user)):
@@ -190,21 +214,25 @@ async def register(user: UserCreate, background_tasks: BackgroundTasks):
         "last_prompt_date": None
     }
     await users_collection.insert_one(user_data)
-    
+
     token = create_special_token(user.username, "email_verification", EMAIL_VERIFICATION_TOKEN_EXPIRE_MINUTES)
     verification_link = f"{FRONTEND_URL}/verify-email?token={token}"
-    message = MessageSchema(
-        subject="Verify Your Account",
-        recipients=[user.email],
-        body=f"Please click the link to verify your account: {verification_link}",
-        subtype="html"
-    )
-    
-    # --- ADDED DEBUG LOG ---
     logging.info(f"Attempting to send verification email to {user.email}")
-    
-    background_tasks.add_task(fm.send_message, message)
+
+    if USE_GMAIL_API:
+        background_tasks.add_task(send_gmail_api, user.email, "Verify Your Account",
+                                  f"Please click the link to verify your account: {verification_link}")
+    else:
+        message = MessageSchema(
+            subject="Verify Your Account",
+            recipients=[user.email],
+            body=f"Please click the link to verify your account: {verification_link}",
+            subtype="html"
+        )
+        background_tasks.add_task(fm.send_message, message)
+
     return {"message": "User created. Please check your email to verify your account."}
+
 
 @app.post("/token", response_model=Token, tags=["Auth"])
 async def login_for_access_token(form_data: TokenRequest):
@@ -221,6 +249,7 @@ async def login_for_access_token(form_data: TokenRequest):
     access_token = create_access_token(data={"sub": user["username"]})
     return {"access_token": access_token, "token_type": "bearer"}
 
+
 @app.post("/verify-email", tags=["Auth"])
 async def verify_email(token: str):
     username = verify_special_token(token, "email_verification")
@@ -231,18 +260,24 @@ async def verify_email(token: str):
         raise HTTPException(status_code=404, detail="User not found for verification.")
     return {"message": "Email verified successfully. You can now log in."}
 
+
 @app.post("/forgot-password", tags=["Auth"])
 async def forgot_password(request: ForgotPasswordRequest, background_tasks: BackgroundTasks):
     user = await users_collection.find_one({"email": request.email})
     if user:
         token = create_special_token(user["username"], "password_reset", PASSWORD_RESET_TOKEN_EXPIRE_MINUTES)
         reset_link = f"{FRONTEND_URL}/reset-password?token={token}"
-        message = MessageSchema(
-            subject="Password Reset Request", recipients=[request.email],
-            body=f"Click the link to reset your password: {reset_link}", subtype="html"
-        )
-        background_tasks.add_task(fm.send_message, message)
+        if USE_GMAIL_API:
+            background_tasks.add_task(send_gmail_api, request.email, "Password Reset Request",
+                                      f"Click the link to reset your password: {reset_link}")
+        else:
+            message = MessageSchema(
+                subject="Password Reset Request", recipients=[request.email],
+                body=f"Click the link to reset your password: {reset_link}", subtype="html"
+            )
+            background_tasks.add_task(fm.send_message, message)
     return {"message": "If an account with that email exists, a password reset link has been sent."}
+
 
 @app.post("/reset-password", tags=["Auth"])
 async def reset_password(request: ResetPasswordRequest):
@@ -253,6 +288,7 @@ async def reset_password(request: ResetPasswordRequest):
     await users_collection.update_one({"username": username}, {"$set": {"hashed_password": hashed_password}})
     return {"message": "Password has been reset successfully."}
 
+
 # --- History Endpoints ---
 @app.get("/history", response_model=List[dict], tags=["History"])
 async def get_history(current_user: dict = Depends(get_current_user)):
@@ -262,6 +298,7 @@ async def get_history(current_user: dict = Depends(get_current_user)):
     ).sort("created_at", -1).limit(50)
     return await history_cursor.to_list(length=50)
 
+
 @app.delete("/history/single/{job_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["History"])
 async def delete_history_item(job_id: str, current_user: dict = Depends(get_current_user)):
     result = await results_store_collection.delete_one({"job_id": job_id, "owner": current_user["username"]})
@@ -269,10 +306,12 @@ async def delete_history_item(job_id: str, current_user: dict = Depends(get_curr
         raise HTTPException(status_code=404, detail="History item not found.")
     return
 
+
 @app.delete("/history/all", status_code=status.HTTP_204_NO_CONTENT, tags=["History"])
 async def delete_all_history(current_user: dict = Depends(get_current_user)):
     await results_store_collection.delete_many({"owner": current_user["username"]})
     return
+
 
 # --- Analysis Endpoints ---
 @app.post("/guest-analyze", response_model=TaskResponse, status_code=202, tags=["Analysis"])
@@ -286,6 +325,7 @@ async def guest_analysis(request: AnalysisRequest, background_tasks: BackgroundT
     background_tasks.add_task(run_analysis_background, request.query, job_id)
     return {"job_id": job_id}
 
+
 @app.post("/analyze", response_model=TaskResponse, status_code=202, tags=["Analysis"])
 async def start_analysis(request: AnalysisRequest, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
     job_id = str(uuid.uuid4())
@@ -297,12 +337,14 @@ async def start_analysis(request: AnalysisRequest, background_tasks: BackgroundT
     background_tasks.add_task(run_analysis_background, request.query, job_id)
     return {"job_id": job_id}
 
+
 @app.get("/guest-status/{job_id}", response_model=ResultResponse, tags=["Analysis"])
 async def get_guest_task_status(job_id: str):
     result = await results_store_collection.find_one({"job_id": job_id, "owner": "guest"})
     if not result:
         raise HTTPException(status_code=404, detail="Analysis not found or it belongs to a registered user.")
     return {"job_id": job_id, "status": result["status"], "result": result.get("result"), "questions_remaining": DAILY_LIMIT}
+
 
 @app.get("/status/{job_id}", response_model=ResultResponse, tags=["Analysis"])
 async def get_task_status(job_id: str, current_user: dict = Depends(get_current_user)):
@@ -321,6 +363,7 @@ async def get_task_status(job_id: str, current_user: dict = Depends(get_current_
     
     return {"job_id": job_id, "status": result["status"], "result": result.get("result"), "questions_remaining": questions_remaining}
 
+
 @app.post("/generate-reasoning/{job_id}", status_code=200, tags=["Analysis"])
 async def start_reasoning_generation(job_id: str, current_user: dict = Depends(get_current_user)):
     analysis_data = await results_store_collection.find_one({"job_id": job_id, "owner": current_user["username"]})
@@ -332,6 +375,7 @@ async def start_reasoning_generation(job_id: str, current_user: dict = Depends(g
     await results_store_collection.update_one({"job_id": job_id}, {"$set": {"result.reasoning_report": reasoning_report}})
     return {"message": "Reasoning report generated successfully."}
 
+
 @app.post("/chat/{job_id}", response_model=ChatResponse, tags=["Chat"])
 async def handle_chat(job_id: str, chat_request: ChatRequest, current_user: dict = Depends(get_current_user), questions_remaining: int = Depends(check_and_update_limit)):
     analysis_data = await results_store_collection.find_one({"job_id": job_id, "owner": current_user["username"]})
@@ -342,6 +386,7 @@ async def handle_chat(job_id: str, chat_request: ChatRequest, current_user: dict
     new_chat_history = chat_history_for_llm + [{"role": "assistant", "content": ai_response}]
     await results_store_collection.update_one({"job_id": job_id}, {"$set": {"result.chat_history": new_chat_history}})
     return ChatResponse(response=ai_response, questions_remaining=questions_remaining)
+
 
 if __name__ == "__main__":
     import uvicorn
