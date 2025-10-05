@@ -1,5 +1,7 @@
 import os
 import uuid
+import logging
+import sys
 from datetime import datetime, timezone
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,6 +27,15 @@ from .auth import (
     PASSWORD_RESET_TOKEN_EXPIRE_MINUTES
 )
 
+# --- SETUP LOGGING ---
+# Ensures logs are sent to the console/Render's log stream
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    stream=sys.stdout
+)
+
+
 DAILY_LIMIT = 5
 
 app = FastAPI(
@@ -43,19 +54,31 @@ app.add_middleware(
 )
 
 # --- Email Configuration ---
-# ... (Email config remains the same)
-conf = ConnectionConfig(
-    MAIL_USERNAME=os.getenv("MAIL_USERNAME"),
-    MAIL_PASSWORD=os.getenv("MAIL_PASSWORD"),
-    MAIL_FROM=os.getenv("MAIL_FROM"),
-    MAIL_PORT=int(os.getenv("MAIL_PORT", 465)),
-    MAIL_SERVER=os.getenv("MAIL_SERVER"),# This will now be 465
-    MAIL_STARTTLS=os.getenv("MAIL_STARTTLS", "True").lower() == "true", # This will now be False
-    MAIL_SSL_TLS=os.getenv("MAIL_SSL_TLS", "False").lower() == "true",
-    USE_CREDENTIALS=True,
-    VALIDATE_CERTS=True
-)
-fm = FastMail(conf)
+# Create a dictionary of the configuration from environment variables
+conf_dict = {
+    "MAIL_USERNAME": os.getenv("MAIL_USERNAME"),
+    "MAIL_PASSWORD": os.getenv("MAIL_PASSWORD"),
+    "MAIL_FROM": os.getenv("MAIL_FROM"),
+    "MAIL_PORT": int(os.getenv("MAIL_PORT", 465)),
+    "MAIL_SERVER": os.getenv("MAIL_SERVER"),
+    "MAIL_STARTTLS": os.getenv("MAIL_STARTTLS", "False").lower() == "true", # Correct default for port 465
+    "MAIL_SSL_TLS": os.getenv("MAIL_SSL_TLS", "True").lower() == "true",   # Correct default for port 465
+    "USE_CREDENTIALS": True,
+    "VALIDATE_CERTS": True
+}
+
+# --- Log the configuration safely upon application startup ---
+log_conf = conf_dict.copy()
+if log_conf.get("MAIL_PASSWORD"):
+    log_conf["MAIL_PASSWORD"] = "**********" # Mask the password for security
+logging.info(f"FastMail configuration loaded: {log_conf}")
+
+try:
+    conf = ConnectionConfig(**conf_dict)
+    fm = FastMail(conf)
+    logging.info("FastMail instance created successfully.")
+except Exception as e:
+    logging.error(f"Failed to create FastMail instance: {e}", exc_info=True)
 
 
 # --- Pydantic Models ---
@@ -102,7 +125,7 @@ class ChatResponse(BaseModel):
     response: str
     questions_remaining: int
 
-# --- Health Check Endpoint (NEW) ---
+# --- Health Check Endpoint ---
 @app.get("/", tags=["Health Check"])
 async def read_root():
     return {"status": "API is running"}
@@ -110,16 +133,16 @@ async def read_root():
 
 # --- Background Task Wrapper ---
 async def run_analysis_background(query: str, job_id: str):
-    print(f"Background task {job_id} started for query: '{query}'")
+    logging.info(f"Background task {job_id} started for query: '{query}'")
     try:
         result_data = await run_full_analysis_pipeline(query)
         await results_store_collection.update_one(
             {"job_id": job_id},
             {"$set": {"status": "completed", "result": result_data}}
         )
-        print(f"Background task {job_id} completed successfully.")
+        logging.info(f"Background task {job_id} completed successfully.")
     except Exception as e:
-        print(f"Background task {job_id} failed: {e}")
+        logging.error(f"Background task {job_id} failed: {e}", exc_info=True)
         await results_store_collection.update_one(
             {"job_id": job_id},
             {"$set": {"status": "failed", "result": {"error": str(e)}}}
@@ -176,6 +199,10 @@ async def register(user: UserCreate, background_tasks: BackgroundTasks):
         body=f"Please click the link to verify your account: {verification_link}",
         subtype="html"
     )
+    
+    # --- ADDED DEBUG LOG ---
+    logging.info(f"Attempting to send verification email to {user.email}")
+    
     background_tasks.add_task(fm.send_message, message)
     return {"message": "User created. Please check your email to verify your account."}
 
@@ -194,7 +221,6 @@ async def login_for_access_token(form_data: TokenRequest):
     access_token = create_access_token(data={"sub": user["username"]})
     return {"access_token": access_token, "token_type": "bearer"}
 
-# ... (Other endpoints remain the same)
 @app.post("/verify-email", tags=["Auth"])
 async def verify_email(token: str):
     username = verify_special_token(token, "email_verification")
@@ -321,4 +347,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
-
